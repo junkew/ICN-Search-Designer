@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-The Master FileNet Stored Search Toolkit (Production Pipeline & Test Data Edition)
-Bevat de definitieve ICN "Split-Brain" generatie, INANY compressie en een Test-Data generator.
+The Master FileNet Stored Search Toolkit (Two-Step Deployment Edition)
+Genereert lokaal -> Handmatige review -> Upload naar ICN.
 #>
 
 #region 1. CONFIGURATIE & BRONDATA
@@ -41,11 +41,11 @@ $global:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
 #region 2. PARSER & GROUPER (EXCEL DATA)
 function Parse-ExcelData([string]$CsvData) {
-    Write-Host "`n[*] Leest en Groepeert Excel data voor INANY optimalisatie..." -ForegroundColor Cyan
+    Write-Host "`n[*] Leest en Groepeert Excel data..." -ForegroundColor Cyan
     $rawRows = $CsvData -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     
     $global:GroupedRows = @{}
-    $global:RawParsedRows = @() # Bewaren we voor de testdata generator
+    $global:RawParsedRows = @() 
     
     foreach ($row in $rawRows) {
         $parts = $row.Trim() -split ";"
@@ -113,17 +113,20 @@ function Build-SearchWrapperXml([string]$whereClause) {
 #endregion
 
 
-#region 4. DEPLOYMENT (EXACT MATCH PIPELINE)
-function Deploy-ExactMatchSearch {
+#region 4. DEPLOYMENT (TWO-STEP PIPELINE)
+
+<#
+.SYNOPSIS
+STAP 1: Genereert de XML en JSON bestanden op de hardeschijf. (Kan offline!).
+#>
+function Generate-ExactMatchFiles {
     param (
         [Parameter(Mandatory=$true)][string]$SearchName,
         [Parameter(Mandatory=$true)][string]$CsvData
     )
 
-    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet." -ForegroundColor Red; return }
-
     Parse-ExcelData -CsvData $CsvData
-    Write-Host "[*] Genereert Gecomprimeerde Whitelist Logica voor '$SearchName'..." -ForegroundColor Cyan
+    Write-Host "`n[*] Bouwt Split-Brain bestanden voor '$SearchName'..." -ForegroundColor Cyan
 
     $baseJsonNodes = @(); $baseXmlNodes = @()
     foreach ($g in $GlobalFilters) {
@@ -168,141 +171,4 @@ function Deploy-ExactMatchSearch {
         searchCriteria = ($baseJsonNodes + @($mainComboJson))
         resultsDisplay = [ordered]@{ 
             sortAsc = $true; columns = @("{NAME}", "ContentSize", "LastModifier", "DateLastModified", "MajorVersionNumber")
-            maxResults = 0; showContentSummary = $false; sortBy = "{NAME}"; honorNameProperty = $true; showChildComponentAttribute = $false
-        }
-    }
-    $formattedJson = $finalJsonObj | ConvertTo-Json -Depth 10
-
-    $whereXml = Build-XmlStaircase ($baseXmlNodes + @($mainComboXml)) "and"
-    if ([string]::IsNullOrEmpty($whereXml)) { $whereXml = "(1=1)" }
-    $rawXml = Build-SearchWrapperXml $whereXml
-
-    $safeName = $SearchName -replace " ", "_"
-    $xmlPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file0.xml"
-    $jsonPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file1.json"
-    [System.IO.File]::WriteAllText($xmlPath, $rawXml, $global:Utf8NoBom)
-    [System.IO.File]::WriteAllText($jsonPath, $formattedJson, $global:Utf8NoBom)
-
-    Write-Host "[*] Uploaden naar ICN..." -ForegroundColor Cyan
-    $query = "SELECT Id FROM StoredSearch WHERE ([IsCurrentVersion] = True) AND (DocumentTitle = '$SearchName')"
-    $enumerator = ([FileNet.Api.Query.SearchScope]::new($fnp8os)).FetchRows([FileNet.Api.Query.SearchSQL]::new($query), $null, $null, $true).GetEnumerator()
-    if (-not $enumerator.MoveNext()) { Write-Host "    [!] Fout: Zoekopdracht bestaat nog niet." -ForegroundColor Red; return }
-
-    $storedSearch = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $enumerator.Current.Properties.GetIdValue("Id"), $null)
-    $storedSearch.Checkout([FileNet.Api.Constants.ReservationType]::Exclusive, $null, $storedSearch.ClassName, $storedSearch.Properties)
-    $storedSearch.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
-
-    $res = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $storedSearch.Reservation.Id, $null)
-    $contentList = [FileNet.Api.Core.Factory+ContentElement]::CreateList()
-
-    $xStream = [System.IO.File]::OpenRead($xmlPath)
-    $ctX = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctX.SetCaptureSource($xStream); $ctX.RetrievalName = "file0"; $ctX.ContentType = "application/x-filenet-searchtemplate"
-    $contentList.Add($ctX)
-
-    $jStream = [System.IO.File]::OpenRead($jsonPath)
-    $ctJ = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctJ.SetCaptureSource($jStream); $ctJ.RetrievalName = "file1"; $ctJ.ContentType = "application/json"
-    $contentList.Add($ctJ)
-    
-    $res.ContentElements = $contentList
-    $res.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
-    $res.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
-    
-    $xStream.Close(); $jStream.Close()
-    Write-Host "    [V] Succes! '$SearchName' is geüpdatet met de INANY logica." -ForegroundColor Green
-}
-#endregion
-
-
-#region 5. TEST DATA GENERATOR
-<#
-.SYNOPSIS
-Genereert 'GOEDE' testdocumenten en specifieke 'FOUTE' combinatiedocumenten in FileNet 
-om te bewijzen dat de Stored Search waterdicht is.
-#>
-function Generate-TestData {
-    param ([string]$CsvData)
-    
-    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet om testdata te genereren." -ForegroundColor Red; return }
-    
-    # Zorg dat Parse-ExcelData is gedraaid
-    if ($null -eq $global:RawParsedRows -or $global:RawParsedRows.Count -eq 0) {
-        Parse-ExcelData -CsvData $CsvData
-    }
-
-    Write-Host "`n[*] Start generatie van Test Documenten..." -ForegroundColor Cyan
-    
-    $uniqueA = @{}; $uniqueO = @{}; $uniqueS = @{}
-    foreach ($row in $global:RawParsedRows) {
-        $uniqueA[$row.F1] = $true
-        $uniqueO[$row.F2] = $true
-        $uniqueS[$row.F3] = $true
-    }
-
-    $docCount = 0
-
-    function Create-TestDoc($titel, $a, $o, $s) {
-        try {
-            $doc = [FileNet.Api.Core.Factory+Document]::CreateInstance($fnp8os, $GlobalConfig.SubclassSymName)
-            $doc.Properties["DocumentTitle"] = $titel
-            $doc.Properties["UWVSleutelkenmerk"] = "23" # Must match base filter
-            $doc.Properties["UWVAandachtsgebied"] = $a
-            $doc.Properties["UWVOnderwerp"] = $o
-            $doc.Properties["UWVSubonderwerp"] = $s
-            $doc.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
-            $doc.Save([FileNet.Api.Constants.RefreshMode]::NO_REFRESH)
-            Write-Host "    -> Aangemaakt: $titel" -ForegroundColor DarkGray
-            return 1
-        } catch {
-            Write-Host "    [!] Fout bij aanmaken document '$titel': $($_.Exception.Message)" -ForegroundColor Red
-            return 0
-        }
-    }
-
-    Write-Host "    1. Geldige documenten genereren (Positieve test - Deze MOETEN gevonden worden)..." -ForegroundColor Yellow
-    foreach ($row in $global:RawParsedRows) {
-        $titel = "TEST GOED - $($row.F1) - $($row.F2) - $($row.F3)"
-        $docCount += Create-TestDoc $titel $row.F1 $row.F2 $row.F3
-    }
-
-    Write-Host "`n    2. Foutieve documenten genereren (Negatieve test - Deze mogen NIET gevonden worden)..." -ForegroundColor Yellow
-    
-    foreach ($val in $uniqueA.Keys) {
-        $docCount += Create-TestDoc "TEST FOUT - Aandachtsgebied: $val" $val "FOUT" "FOUT"
-    }
-    foreach ($val in $uniqueO.Keys) {
-        $docCount += Create-TestDoc "TEST FOUT - Onderwerp: $val" "FOUT" $val "FOUT"
-    }
-    foreach ($val in $uniqueS.Keys) {
-        $docCount += Create-TestDoc "TEST FOUT - Subonderwerp: $val" "FOUT" "FOUT" $val
-    }
-
-    Write-Host "    [V] Klaar! $docCount testdocumenten succesvol aangemaakt in FileNet." -ForegroundColor Green
-}
-#endregion
-
-
-#region 6. EXECUTION
-<#
-====================================================================================
-  JOUW GEAUTOMATISEERDE PRODUCTIE PIPELINE
-====================================================================================
-#>
-
-$mijnLangeExcelData = @"
-WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 1
-WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 2
-WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 3
-WAZ;Vaststellen recht, hoogte, duur;Wettelijke rente
-WAO;Vaststellen recht, hoogte, duur;Wettelijke rente
-WAJONG;Aanvraag/Intake;Bezwaar en Beroep
-WAO;Aanvraag/Intake;Bezwaar en Beroep
-WIA;Aanvraag/Intake;Bezwaar en Beroep
-"@
-
-# 1. Update de ICN Stored Search met de nieuwe data
-Deploy-ExactMatchSearch -SearchName "ZO GEN PRODUCTIEVERSIE" -CsvData $mijnLangeExcelData
-
-# 2. Genereer Test Data (Voer dit eenmalig uit op je testomgeving)
-# Generate-TestData -CsvData $mijnLangeExcelData
-
-#endregion
+            maxResults = 0; showContentSummary = $false; sortBy = "{NAME}"; honorNameProperty = $true; showChildComponent
