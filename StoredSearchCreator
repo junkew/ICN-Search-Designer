@@ -1,0 +1,308 @@
+<#
+.SYNOPSIS
+The Master FileNet Stored Search Toolkit (Production Pipeline & Test Data Edition)
+Bevat de definitieve ICN "Split-Brain" generatie, INANY compressie en een Test-Data generator.
+#>
+
+#region 1. CONFIGURATIE & BRONDATA
+$GlobalConfig = @{
+    ObjectType      = "document"
+    ClassName       = "document"           
+    SubclassSymName = "UWVDocument"        
+    RepositoryId    = "demorepo1"          
+    OutputDir       = "$env:HOMEPATH\Desktop\SearchExport"
+}
+
+if (-not (Test-Path $GlobalConfig.OutputDir)) { New-Item -ItemType Directory -Path $GlobalConfig.OutputDir | Out-Null }
+
+$PropertyDefs = @(
+    @{ SymName = "UWVSleutelkenmerk";  Name = "UWVSleutelkenmerk"; DataType = "xs:string";    EngineType = "typestring" }
+    @{ SymName = "DateCreated";        Name = "DateCreated";       DataType = "xs:timestamp"; EngineType = "typedate" }
+    @{ SymName = "UWVAandachtsgebied"; Name = "Aandachtsgebied";   DataType = "xs:string";    EngineType = "typestring" }
+    @{ SymName = "UWVOnderwerp";       Name = "Onderwerp";         DataType = "xs:string";    EngineType = "typestring" }
+    @{ SymName = "UWVSubonderwerp";    Name = "Subonderwerp";      DataType = "xs:string";    EngineType = "typestring" }
+)
+$global:PropLookup = @{}
+$PropertyDefs | ForEach-Object { $global:PropLookup[$_.SymName] = $_ }
+
+# Basisgroep velden (Zichtbaar in ICN)
+$GlobalFilters = @(
+    @{ SymName = "UWVSleutelkenmerk"; Operator = "EQUAL";          Values = @("23", "") }
+    @{ SymName = "DateCreated";       Operator = "GREATEROREQUAL"; Values = @("2026-03-01T00:00:00.000+01:00", "") }
+    @{ SymName = "DateCreated";       Operator = "LESSOREQUAL";    Values = @("2026-03-22T00:00:00.000+01:00", "") }
+)
+
+# Combinatie velden (Worden omgezet naar INANY in JSON, en Binaire trappen in XML)
+$CombinationFields = @("UWVAandachtsgebied", "UWVOnderwerp", "UWVSubonderwerp")
+
+$global:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+#endregion
+
+
+#region 2. PARSER & GROUPER (EXCEL DATA)
+function Parse-ExcelData([string]$CsvData) {
+    Write-Host "`n[*] Leest en Groepeert Excel data voor INANY optimalisatie..." -ForegroundColor Cyan
+    $rawRows = $CsvData -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    
+    $global:GroupedRows = @{}
+    $global:RawParsedRows = @() # Bewaren we voor de testdata generator
+    
+    foreach ($row in $rawRows) {
+        $parts = $row.Trim() -split ";"
+        if ($parts.Count -ne $CombinationFields.Count) { continue }
+        
+        $f1 = $parts[0]; $f2 = $parts[1]; $f3 = $parts[2]
+        $global:RawParsedRows += @{ F1=$f1; F2=$f2; F3=$f3 }
+        
+        $key = "$f1||$f2"
+        if (-not $global:GroupedRows.ContainsKey($key)) {
+            $global:GroupedRows[$key] = @{ Field1 = $f1; Field2 = $f2; Values3 = @() }
+        }
+        
+        if ($f3 -notin $global:GroupedRows[$key].Values3) {
+            $global:GroupedRows[$key].Values3 += $f3
+        }
+    }
+    Write-Host "    $($rawRows.Count) regels ingelezen en gecomprimeerd tot $($global:GroupedRows.Count) unieke groepen." -ForegroundColor Green
+}
+#endregion
+
+
+#region 3. GENERATOR HELPERS
+$global:xmlItemId = 1000 
+
+function Build-XmlStaircase([array]$nodes, [string]$opTag) {
+    if ($nodes.Count -eq 0) { return "" }; if ($nodes.Count -eq 1) { return $nodes[0] } 
+    $first = $nodes[0]
+    if ($nodes.Count -eq 2) { return "<$opTag>$first$($nodes[1])</$opTag>" }
+    $rest = Build-XmlStaircase $nodes[1..($nodes.Count - 1)] $opTag
+    return "<$opTag>$first$rest</$opTag>"
+}
+
+function Get-XmlNode($Sym, $Op, $Val, $isHidden) {
+    $def = $global:PropLookup[$Sym]; $datatype = $def.EngineType; $objType = $GlobalConfig.ObjectType
+    $editprop = if ($isHidden) { "hidden" } else { "editable" }
+    $xmlOp = "eq"; if ($Op -eq "GREATEROREQUAL") { $xmlOp = "gte" }; if ($Op -eq "LESSOREQUAL") { $xmlOp = "lte" }; if ($Op -eq "NOTEQUAL") { $xmlOp = "neq" }
+    $id = $global:xmlItemId++
+    return "<$xmlOp><whereprop editproperty=`"$editprop`" name=`"$($def.Name)`" objecttype=`"$objType`" symname=`"$Sym`" itemid=`"$id`"><propdesc datatype=`"$datatype`" haschoices=`"false`" hasmarkings=`"false`" symname=`"$Sym`" /></whereprop><literal><![CDATA[$Val]]></literal></$xmlOp>"
+}
+
+function Get-JsonNode($Sym, $Op, $Val, $isHidden) {
+    $def = $global:PropLookup[$Sym]
+    return [ordered]@{
+        itemId = ""; displayValues = @(); hasSelectedOperators = $false; hidden = $isHidden
+        dataType = $def.DataType; values = @($Val, ""); name = $def.Name
+        selectedOperator = $Op; readOnly = $false; id = $Sym; cardinality = "SINGLE"; required = $false
+    }
+}
+
+function Build-SearchWrapperXml([string]$whereClause) {
+    $osId = if ($null -ne $fnp8os) { $fnp8os.Id.ToString() } else { "{00000000-0000-0000-0000-000000000000}" }
+    $scId = $global:xmlItemId++
+    $raw = @"
+<?xml version="1.0"?><storedsearch xmlns="http://filenet.com/namespaces/wcm/apps/1.0"><version dtd="3.0" searchobject="3" /><product name="Navigator" version="3.2.0" /><searchspec versionselection="releasedversion"><searchtype><template showandorconditions="true" showmaxrecords="false" showoperators="true" /></searchtype><objectstores mergeoption="union"><objectstore id="$osId" name="OS01" repositoryId="$($GlobalConfig.RepositoryId)" /></objectstores><searchcriteria><folders></folders><searchclauses><searchclause join="and"><select><selectprops>
+<selectprop alignment="left" itemid="1" name="DocumentTitle" objecttype="document" sortlevel="1" sortorder="ascending" symname="DocumentTitle" />
+<selectprop alignment="left" itemid="2" name="ContentSize" objecttype="document" sortlevel="0" sortorder="none" symname="ContentSize" />
+<selectprop alignment="left" itemid="3" name="LastModifier" objecttype="document" sortlevel="0" sortorder="none" symname="LastModifier" />
+<selectprop alignment="left" itemid="4" name="DateLastModified" objecttype="document" sortlevel="0" sortorder="none" symname="DateLastModified" />
+<selectprop alignment="left" itemid="5" name="MajorVersionNumber" objecttype="document" sortlevel="0" sortorder="none" symname="MajorVersionNumber" />
+</selectprops></select><from><class symname="$($GlobalConfig.ClassName)" /></from><where>$whereClause</where><subclasses><subclass editproperty="hidden" itemid="$scId" name="$($GlobalConfig.SubclassSymName)" objecttype="$($GlobalConfig.ObjectType)" symname="$($GlobalConfig.SubclassSymName)" includesubclasses="true"/></subclasses></searchclause></searchclauses></searchcriteria></searchspec></storedsearch>
+"@
+    return $raw -replace '>\s+<', '><' -replace "`r|`n", ""
+}
+#endregion
+
+
+#region 4. DEPLOYMENT (EXACT MATCH PIPELINE)
+function Deploy-ExactMatchSearch {
+    param (
+        [Parameter(Mandatory=$true)][string]$SearchName,
+        [Parameter(Mandatory=$true)][string]$CsvData
+    )
+
+    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet." -ForegroundColor Red; return }
+
+    Parse-ExcelData -CsvData $CsvData
+    Write-Host "[*] Genereert Gecomprimeerde Whitelist Logica voor '$SearchName'..." -ForegroundColor Cyan
+
+    $baseJsonNodes = @(); $baseXmlNodes = @()
+    foreach ($g in $GlobalFilters) {
+        $baseJsonNodes += Get-JsonNode $g.SymName $g.Operator $g.Values[0] $false
+        $baseXmlNodes += Get-XmlNode $g.SymName $g.Operator $g.Values[0] $false
+    }
+
+    $rowJsonBlocks = @(); $rowXmlBlocks = @()
+
+    foreach ($key in $global:GroupedRows.Keys) {
+        $group = $global:GroupedRows[$key]
+        $cellJsonNodes = @(); $cellXmlNodes = @()
+
+        $cellJsonNodes += Get-JsonNode $CombinationFields[0] "EQUAL" $group.Field1 $false
+        $cellXmlNodes += Get-XmlNode $CombinationFields[0] "EQUAL" $group.Field1 $false
+        
+        $cellJsonNodes += Get-JsonNode $CombinationFields[1] "EQUAL" $group.Field2 $false
+        $cellXmlNodes += Get-XmlNode $CombinationFields[1] "EQUAL" $group.Field2 $false
+
+        $f3Sym = $CombinationFields[2]; $f3Def = $global:PropLookup[$f3Sym]
+
+        $inanyJsonNode = [ordered]@{
+            itemId = ""; displayValues = @(); hasSelectedOperators = $false; hidden = $false
+            dataType = $f3Def.DataType; values = @($group.Values3) + ""; name = $f3Def.Name
+            selectedOperator = "INANY"; readOnly = $false; id = $f3Sym; cardinality = "SINGLE"; required = $false
+        }
+        $cellJsonNodes += $inanyJsonNode
+
+        $f3XmlSubNodes = @()
+        foreach ($v3 in $group.Values3) { $f3XmlSubNodes += Get-XmlNode $f3Sym "EQUAL" $v3 $false }
+        $cellXmlNodes += Build-XmlStaircase $f3XmlSubNodes "or"
+
+        $rowJsonBlocks += [ordered]@{ anded = $true; searchCriteria = $cellJsonNodes }
+        $rowXmlBlocks += Build-XmlStaircase $cellXmlNodes "and"
+    }
+
+    $mainComboJson = [ordered]@{ anded = $false; searchCriteria = $rowJsonBlocks }
+    $mainComboXml = Build-XmlStaircase $rowXmlBlocks "or"
+
+    $finalJsonObj = [ordered]@{
+        includeAllProperties = $false; macros = [ordered]@{}; 
+        searchCriteria = ($baseJsonNodes + @($mainComboJson))
+        resultsDisplay = [ordered]@{ 
+            sortAsc = $true; columns = @("{NAME}", "ContentSize", "LastModifier", "DateLastModified", "MajorVersionNumber")
+            maxResults = 0; showContentSummary = $false; sortBy = "{NAME}"; honorNameProperty = $true; showChildComponentAttribute = $false
+        }
+    }
+    $formattedJson = $finalJsonObj | ConvertTo-Json -Depth 10
+
+    $whereXml = Build-XmlStaircase ($baseXmlNodes + @($mainComboXml)) "and"
+    if ([string]::IsNullOrEmpty($whereXml)) { $whereXml = "(1=1)" }
+    $rawXml = Build-SearchWrapperXml $whereXml
+
+    $safeName = $SearchName -replace " ", "_"
+    $xmlPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file0.xml"
+    $jsonPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file1.json"
+    [System.IO.File]::WriteAllText($xmlPath, $rawXml, $global:Utf8NoBom)
+    [System.IO.File]::WriteAllText($jsonPath, $formattedJson, $global:Utf8NoBom)
+
+    Write-Host "[*] Uploaden naar ICN..." -ForegroundColor Cyan
+    $query = "SELECT Id FROM StoredSearch WHERE ([IsCurrentVersion] = True) AND (DocumentTitle = '$SearchName')"
+    $enumerator = ([FileNet.Api.Query.SearchScope]::new($fnp8os)).FetchRows([FileNet.Api.Query.SearchSQL]::new($query), $null, $null, $true).GetEnumerator()
+    if (-not $enumerator.MoveNext()) { Write-Host "    [!] Fout: Zoekopdracht bestaat nog niet." -ForegroundColor Red; return }
+
+    $storedSearch = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $enumerator.Current.Properties.GetIdValue("Id"), $null)
+    $storedSearch.Checkout([FileNet.Api.Constants.ReservationType]::Exclusive, $null, $storedSearch.ClassName, $storedSearch.Properties)
+    $storedSearch.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
+
+    $res = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $storedSearch.Reservation.Id, $null)
+    $contentList = [FileNet.Api.Core.Factory+ContentElement]::CreateList()
+
+    $xStream = [System.IO.File]::OpenRead($xmlPath)
+    $ctX = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctX.SetCaptureSource($xStream); $ctX.RetrievalName = "file0"; $ctX.ContentType = "application/x-filenet-searchtemplate"
+    $contentList.Add($ctX)
+
+    $jStream = [System.IO.File]::OpenRead($jsonPath)
+    $ctJ = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctJ.SetCaptureSource($jStream); $ctJ.RetrievalName = "file1"; $ctJ.ContentType = "application/json"
+    $contentList.Add($ctJ)
+    
+    $res.ContentElements = $contentList
+    $res.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
+    $res.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
+    
+    $xStream.Close(); $jStream.Close()
+    Write-Host "    [V] Succes! '$SearchName' is geüpdatet met de INANY logica." -ForegroundColor Green
+}
+#endregion
+
+
+#region 5. TEST DATA GENERATOR
+<#
+.SYNOPSIS
+Genereert 'GOEDE' testdocumenten en specifieke 'FOUTE' combinatiedocumenten in FileNet 
+om te bewijzen dat de Stored Search waterdicht is.
+#>
+function Generate-TestData {
+    param ([string]$CsvData)
+    
+    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet om testdata te genereren." -ForegroundColor Red; return }
+    
+    # Zorg dat Parse-ExcelData is gedraaid
+    if ($null -eq $global:RawParsedRows -or $global:RawParsedRows.Count -eq 0) {
+        Parse-ExcelData -CsvData $CsvData
+    }
+
+    Write-Host "`n[*] Start generatie van Test Documenten..." -ForegroundColor Cyan
+    
+    $uniqueA = @{}; $uniqueO = @{}; $uniqueS = @{}
+    foreach ($row in $global:RawParsedRows) {
+        $uniqueA[$row.F1] = $true
+        $uniqueO[$row.F2] = $true
+        $uniqueS[$row.F3] = $true
+    }
+
+    $docCount = 0
+
+    function Create-TestDoc($titel, $a, $o, $s) {
+        try {
+            $doc = [FileNet.Api.Core.Factory+Document]::CreateInstance($fnp8os, $GlobalConfig.SubclassSymName)
+            $doc.Properties["DocumentTitle"] = $titel
+            $doc.Properties["UWVSleutelkenmerk"] = "23" # Must match base filter
+            $doc.Properties["UWVAandachtsgebied"] = $a
+            $doc.Properties["UWVOnderwerp"] = $o
+            $doc.Properties["UWVSubonderwerp"] = $s
+            $doc.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
+            $doc.Save([FileNet.Api.Constants.RefreshMode]::NO_REFRESH)
+            Write-Host "    -> Aangemaakt: $titel" -ForegroundColor DarkGray
+            return 1
+        } catch {
+            Write-Host "    [!] Fout bij aanmaken document '$titel': $($_.Exception.Message)" -ForegroundColor Red
+            return 0
+        }
+    }
+
+    Write-Host "    1. Geldige documenten genereren (Positieve test - Deze MOETEN gevonden worden)..." -ForegroundColor Yellow
+    foreach ($row in $global:RawParsedRows) {
+        $titel = "TEST GOED - $($row.F1) - $($row.F2) - $($row.F3)"
+        $docCount += Create-TestDoc $titel $row.F1 $row.F2 $row.F3
+    }
+
+    Write-Host "`n    2. Foutieve documenten genereren (Negatieve test - Deze mogen NIET gevonden worden)..." -ForegroundColor Yellow
+    
+    foreach ($val in $uniqueA.Keys) {
+        $docCount += Create-TestDoc "TEST FOUT - Aandachtsgebied: $val" $val "FOUT" "FOUT"
+    }
+    foreach ($val in $uniqueO.Keys) {
+        $docCount += Create-TestDoc "TEST FOUT - Onderwerp: $val" "FOUT" $val "FOUT"
+    }
+    foreach ($val in $uniqueS.Keys) {
+        $docCount += Create-TestDoc "TEST FOUT - Subonderwerp: $val" "FOUT" "FOUT" $val
+    }
+
+    Write-Host "    [V] Klaar! $docCount testdocumenten succesvol aangemaakt in FileNet." -ForegroundColor Green
+}
+#endregion
+
+
+#region 6. EXECUTION
+<#
+====================================================================================
+  JOUW GEAUTOMATISEERDE PRODUCTIE PIPELINE
+====================================================================================
+#>
+
+$mijnLangeExcelData = @"
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 1
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 2
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 3
+WAZ;Vaststellen recht, hoogte, duur;Wettelijke rente
+WAO;Vaststellen recht, hoogte, duur;Wettelijke rente
+WAJONG;Aanvraag/Intake;Bezwaar en Beroep
+WAO;Aanvraag/Intake;Bezwaar en Beroep
+WIA;Aanvraag/Intake;Bezwaar en Beroep
+"@
+
+# 1. Update de ICN Stored Search met de nieuwe data
+Deploy-ExactMatchSearch -SearchName "ZO GEN PRODUCTIEVERSIE" -CsvData $mijnLangeExcelData
+
+# 2. Genereer Test Data (Voer dit eenmalig uit op je testomgeving)
+# Generate-TestData -CsvData $mijnLangeExcelData
+
+#endregion
