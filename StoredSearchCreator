@@ -171,4 +171,161 @@ function Generate-ExactMatchFiles {
         searchCriteria = ($baseJsonNodes + @($mainComboJson))
         resultsDisplay = [ordered]@{ 
             sortAsc = $true; columns = @("{NAME}", "ContentSize", "LastModifier", "DateLastModified", "MajorVersionNumber")
-            maxResults = 0; showContentSummary = $false; sortBy = "{NAME}"; honorNameProperty = $true; showChildComponent
+            maxResults = 0; showContentSummary = $false; sortBy = "{NAME}"; honorNameProperty = $true; showChildComponentAttribute = $false
+        }
+    }
+    $formattedJson = $finalJsonObj | ConvertTo-Json -Depth 10
+
+    $whereXml = Build-XmlStaircase ($baseXmlNodes + @($mainComboXml)) "and"
+    if ([string]::IsNullOrEmpty($whereXml)) { $whereXml = "(1=1)" }
+    $rawXml = Build-SearchWrapperXml $whereXml
+
+    $safeName = $SearchName -replace " ", "_"
+    $xmlPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file0.xml"
+    $jsonPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file1.json"
+    
+    [System.IO.File]::WriteAllText($xmlPath, $rawXml, $global:Utf8NoBom)
+    [System.IO.File]::WriteAllText($jsonPath, $formattedJson, $global:Utf8NoBom)
+
+    Write-Host "    [V] Bestanden succesvol gegenereerd!" -ForegroundColor Green
+    Write-Host "        XML:  $xmlPath" -ForegroundColor DarkGray
+    Write-Host "        JSON: $jsonPath" -ForegroundColor DarkGray
+    Write-Host "    -> TIP: Je kunt deze bestanden nu nakijken in VSCode of Notepad++." -ForegroundColor Yellow
+}
+
+<#
+.SYNOPSIS
+STAP 2: Leest de lokale XML en JSON bestanden in en uploadt deze naar ICN.
+#>
+function Deploy-ExactMatchFiles {
+    param (
+        [Parameter(Mandatory=$true)][string]$SearchName
+    )
+
+    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet. Verbind eerst om te uploaden!" -ForegroundColor Red; return }
+
+    $safeName = $SearchName -replace " ", "_"
+    $xmlPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file0.xml"
+    $jsonPath = "$($GlobalConfig.OutputDir)\EXACT_$($safeName)_file1.json"
+
+    if (-not (Test-Path $xmlPath) -or -not (Test-Path $jsonPath)) {
+        Write-Host "`n[!] Fout: Kan de bestanden voor '$SearchName' niet vinden in de export map." -ForegroundColor Red
+        Write-Host "    Zorg dat je eerst 'Generate-ExactMatchFiles' hebt gedraaid." -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host "`n[*] Uploaden van lokale bestanden naar ICN..." -ForegroundColor Cyan
+    $query = "SELECT Id FROM StoredSearch WHERE ([IsCurrentVersion] = True) AND (DocumentTitle = '$SearchName')"
+    $enumerator = ([FileNet.Api.Query.SearchScope]::new($fnp8os)).FetchRows([FileNet.Api.Query.SearchSQL]::new($query), $null, $null, $true).GetEnumerator()
+    if (-not $enumerator.MoveNext()) { Write-Host "    [!] Fout: Zoekopdracht '$SearchName' bestaat nog niet in ICN." -ForegroundColor Red; return }
+
+    $storedSearch = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $enumerator.Current.Properties.GetIdValue("Id"), $null)
+    $storedSearch.Checkout([FileNet.Api.Constants.ReservationType]::Exclusive, $null, $storedSearch.ClassName, $storedSearch.Properties)
+    $storedSearch.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
+
+    $res = [FileNet.Api.Core.Factory+StoredSearch]::FetchInstance($fnp8os, $storedSearch.Reservation.Id, $null)
+    $contentList = [FileNet.Api.Core.Factory+ContentElement]::CreateList()
+
+    $xStream = [System.IO.File]::OpenRead($xmlPath)
+    $ctX = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctX.SetCaptureSource($xStream); $ctX.RetrievalName = "file0"; $ctX.ContentType = "application/x-filenet-searchtemplate"
+    $contentList.Add($ctX)
+
+    $jStream = [System.IO.File]::OpenRead($jsonPath)
+    $ctJ = [FileNet.Api.Core.Factory+ContentTransfer]::CreateInstance(); $ctJ.SetCaptureSource($jStream); $ctJ.RetrievalName = "file1"; $ctJ.ContentType = "application/json"
+    $contentList.Add($ctJ)
+    
+    $res.ContentElements = $contentList
+    $res.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
+    $res.Save([FileNet.Api.Constants.RefreshMode]::Refresh)
+    
+    $xStream.Close(); $jStream.Close()
+    Write-Host "    [V] Succes! '$SearchName' is in ICN geüpdatet met jouw lokale bestanden." -ForegroundColor Green
+}
+#endregion
+
+
+#region 5. TEST DATA GENERATOR
+function Generate-TestData {
+    param ([string]$CsvData)
+    
+    if ($null -eq $fnp8os) { Write-Host "`n[!] Geen connectie met FileNet om testdata te genereren." -ForegroundColor Red; return }
+    
+    if ($null -eq $global:RawParsedRows -or $global:RawParsedRows.Count -eq 0) {
+        Parse-ExcelData -CsvData $CsvData
+    }
+
+    Write-Host "`n[*] Start generatie van Test Documenten..." -ForegroundColor Cyan
+    
+    $uniqueA = @{}; $uniqueO = @{}; $uniqueS = @{}
+    foreach ($row in $global:RawParsedRows) {
+        $uniqueA[$row.F1] = $true; $uniqueO[$row.F2] = $true; $uniqueS[$row.F3] = $true
+    }
+
+    $docCount = 0
+
+    function Create-TestDoc($titel, $a, $o, $s) {
+        try {
+            $doc = [FileNet.Api.Core.Factory+Document]::CreateInstance($fnp8os, $GlobalConfig.SubclassSymName)
+            $doc.Properties["DocumentTitle"] = $titel
+            $doc.Properties["UWVSleutelkenmerk"] = "23" 
+            $doc.Properties["UWVAandachtsgebied"] = $a
+            $doc.Properties["UWVOnderwerp"] = $o
+            $doc.Properties["UWVSubonderwerp"] = $s
+            $doc.Checkin([FileNet.Api.Constants.AutoClassify]::DO_NOT_AUTO_CLASSIFY, [FileNet.Api.Constants.CheckinType]::MAJOR_VERSION)
+            $doc.Save([FileNet.Api.Constants.RefreshMode]::NO_REFRESH)
+            Write-Host "    -> Aangemaakt: $titel" -ForegroundColor DarkGray
+            return 1
+        } catch {
+            Write-Host "    [!] Fout bij aanmaken document '$titel': $($_.Exception.Message)" -ForegroundColor Red
+            return 0
+        }
+    }
+
+    Write-Host "    1. Geldige documenten genereren (Positieve test - Deze MOETEN gevonden worden)..." -ForegroundColor Yellow
+    foreach ($row in $global:RawParsedRows) {
+        $titel = "TEST GOED - $($row.F1) - $($row.F2) - $($row.F3)"
+        $docCount += Create-TestDoc $titel $row.F1 $row.F2 $row.F3
+    }
+
+    Write-Host "`n    2. Foutieve documenten genereren (Negatieve test - Deze mogen NIET gevonden worden)..." -ForegroundColor Yellow
+    foreach ($val in $uniqueA.Keys) { $docCount += Create-TestDoc "TEST FOUT - Aandachtsgebied: $val" $val "FOUT" "FOUT" }
+    foreach ($val in $uniqueO.Keys) { $docCount += Create-TestDoc "TEST FOUT - Onderwerp: $val" "FOUT" $val "FOUT" }
+    foreach ($val in $uniqueS.Keys) { $docCount += Create-TestDoc "TEST FOUT - Subonderwerp: $val" "FOUT" "FOUT" $val }
+
+    Write-Host "    [V] Klaar! $docCount testdocumenten succesvol aangemaakt in FileNet." -ForegroundColor Green
+}
+#endregion
+
+
+#region 6. EXECUTION PIPELINE
+<#
+====================================================================================
+  JOUW GEAUTOMATISEERDE TWEETRAPS PIPELINE
+====================================================================================
+#>
+
+$mijnLangeExcelData = @"
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 1
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 2
+WIA;Vaststellen recht, hoogte, duur;Wettelijke rente 3
+WAZ;Vaststellen recht, hoogte, duur;Wettelijke rente
+WAO;Vaststellen recht, hoogte, duur;Wettelijke rente
+WAJONG;Aanvraag/Intake;Bezwaar en Beroep
+WAO;Aanvraag/Intake;Bezwaar en Beroep
+WIA;Aanvraag/Intake;Bezwaar en Beroep
+"@
+
+$MijnICNZoekNaam = "Mijn Echte Productie Zoekvraag"
+
+# --- STAP 1: Genereer de bestanden en sla ze lokaal op (Dit kan OFFLINE!) ---
+# Generate-ExactMatchFiles -SearchName $MijnICNZoekNaam -CsvData $mijnLangeExcelData
+
+# --- (TUSSENSTAP: Open VSCode en pas file0.xml of file1.json aan indien nodig) ---
+
+# --- STAP 2: Upload de lokale bestanden naar FileNet ---
+# Deploy-ExactMatchFiles -SearchName $MijnICNZoekNaam
+
+# --- STAP 3: Genereer de Test Data (Voer dit eenmalig uit per omgeving) ---
+# Generate-TestData -CsvData $mijnLangeExcelData
+
+#endregion
